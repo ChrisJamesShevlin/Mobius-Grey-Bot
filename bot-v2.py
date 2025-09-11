@@ -12,6 +12,12 @@ ALF — Explorer + Cloud Eval + Stockfish blended UCI engine (+ tiny ML reranker
 - NEW: UseReranker (tiny ML tie-window reranker), TieWindowCP
 - NEW: Advertises SyzygyPath / UCI_LimitStrength / UCI_Elo / UCI_ShowWDL / UCI_AnalyseMode / UCI_Chess960 as no-ops.
 
+Quick-strength tweaks:
+- Move Overhead applied to time management
+- Online (Explorer/Cloud) skipped in time-pressure / tiny movetime
+- LRU cache for Explorer/Cloud
+- SyzygyPath forwarded to Stockfish
+
 Requires:
     pip install python-chess requests
     sudo apt install stockfish   (or set env STOCKFISH_PATH)
@@ -28,6 +34,7 @@ import shutil
 import threading
 import math
 import pickle
+from functools import lru_cache
 from typing import Optional, Dict, List, Tuple
 
 import requests
@@ -105,7 +112,7 @@ def _sigmoid(x: float) -> float:
     except OverflowError:
         return 0.0 if x < 0 else 1.0
 
-# --------------------- online data --------------------
+# --------------------- online data (+ LRU cache) --------------------
 def explorer_request(fen: str, topn: int) -> Optional[dict]:
     params = {"fen": fen, "variant": "standard", "moves": max(1, topn), "topGames": 0, "recentGames": 0}
     try:
@@ -125,6 +132,14 @@ def cloud_request(fen: str, multi_pv: int) -> Optional[dict]:
     except Exception:
         pass
     return None
+
+@lru_cache(maxsize=8192)
+def explorer_request_cached(fen: str, topn: int) -> dict:
+    return explorer_request(fen, topn) or {}
+
+@lru_cache(maxsize=8192)
+def cloud_request_cached(fen: str, multi_pv: int) -> dict:
+    return cloud_request(fen, multi_pv) or {}
 
 def explorer_bonus_for(uci: str, ex: dict, min_games: int, cap_cp: float) -> float:
     """Return cp-like EV from Explorer for a specific move (0 if below min_games)."""
@@ -165,7 +180,7 @@ class ALFEngine:
         # UCI options (must accept for lichess-bot)
         self.hash = DF_HASH
         self.threads = DF_THREADS
-        self.move_overhead = 200
+        self.move_overhead = 200   # milliseconds
         self.ponder = False
 
         # Tunables (also via UCI options)
@@ -181,6 +196,10 @@ class ALFEngine:
         self.use_reranker = True
         self.tie_window_cp = 25
         self.model = _safe_load_model()  # optional pickle (e.g., LogisticRegression/LightGBM)
+        try:
+            print(f"info string reranker={'model' if self.model else 'fallback'}", flush=True)
+        except Exception:
+            pass
 
         # No-op placeholders (make wrappers happy, keep max strength)
         self.syzygy_path = ""
@@ -360,6 +379,10 @@ class ALFEngine:
                 self.tie_window_cp = max(0, int(value))
             elif key == "syzygypath":
                 self.syzygy_path = value or ""
+                try:
+                    self.sf.configure({"SyzygyPath": self.syzygy_path})
+                except Exception:
+                    pass
             elif key == "uci_limitstrength":
                 self.uci_limit_strength = False
             elif key == "uci_elo":
@@ -373,7 +396,7 @@ class ALFEngine:
         except Exception:
             pass
 
-    # ---- Position / search logic (unchanged) ----
+    # ---- Position / search logic ----
     def position(self, tokens: List[str]):
         if not tokens: return
         if tokens[0] == "startpos":
@@ -392,16 +415,30 @@ class ALFEngine:
                     try: self.board.push_uci(u)
                     except Exception: break
 
+    def _should_query_online(self, movetime_ms: Optional[int], wtime: Optional[int], btime: Optional[int]) -> bool:
+        # Skip online calls in tiny movetime or severe time pressure
+        if movetime_ms is not None and movetime_ms < 200:
+            return False
+        if wtime is not None and btime is not None:
+            side_ms = wtime if self.board.turn == chess.WHITE else btime
+            if side_ms < 3000:
+                return False
+        return True
+
     def sf_heads(self, movetime_ms: Optional[int], wtime: Optional[int], btime: Optional[int],
                  winc: int, binc: int) -> List[Tuple[chess.Move, int]]:
         if movetime_ms is not None:
-            limit = chess.engine.Limit(time=max(0.01, movetime_ms / 1000.0))
+            # Apply Move Overhead
+            oh = max(0.0, self.move_overhead)
+            tm_ms = max(10.0, movetime_ms - oh)
+            limit = chess.engine.Limit(time=tm_ms / 1000.0)
         elif wtime is not None and btime is not None:
             side = self.board.turn
-            rem = (wtime if side == chess.WHITE else btime) / 1000.0
-            inc = (winc if side == chess.WHITE else binc) / 1000.0
-            t = max(0.04, min(5.0, rem / 30.0 + inc))
-            limit = chess.engine.Limit(time=t)
+            rem_ms = float(wtime if side == chess.WHITE else btime)
+            inc_ms = float(winc if side == chess.WHITE else binc)
+            oh = max(0.0, float(self.move_overhead))
+            t_ms = max(40.0, min(5000.0, rem_ms / 30.0 + inc_ms - oh))
+            limit = chess.engine.Limit(time=t_ms / 1000.0)
         else:
             limit = chess.engine.Limit(depth=self.sf_depth)
 
@@ -435,8 +472,10 @@ class ALFEngine:
             return None
 
         fen = self.board.fen()
-        ex = explorer_request(fen, self.expl_topn)
-        cl = cloud_request(fen, self.cloud_multipv)
+        ex = cl = None
+        if (self.expl_weight > 0 or self.cloud_weight > 0) and self._should_query_online(movetime_ms, wtime, btime):
+            ex = explorer_request_cached(fen, self.expl_topn)
+            cl = cloud_request_cached(fen, self.cloud_multipv)
 
         # Baseline: compute blended scores (your existing logic)
         blended_scores: List[Tuple[chess.Move, int, float]] = []
@@ -469,7 +508,7 @@ class ALFEngine:
         # Score with model
         best_mv_ml, best_s = None, -1e9
         for mv, base_cp, _ in candidates:
-            feats = self._features_for(mv, base_cp, ex, cl)
+            feats = self._features_for(mv, base_cp, ex or {}, cl or {})
             s = self._score_with_model(feats)
             if s > best_s:
                 best_s, best_mv_ml = s, mv
