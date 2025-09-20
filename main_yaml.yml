@@ -1,0 +1,75 @@
+token: ""
+url: "https://lichess.org/"
+
+engine:
+  dir: "/home/chris/Documents/Python_Projects/Chess"
+  name: "Mobius-Grey-bot.py"
+  cmd: ["python3", "Mobius-Grey-bot.py"]
+  working_dir: "/home/chris/Documents/Python_Projects/Chess"
+  protocol: "uci"
+  ponder: false
+
+  uci_options:
+    # FAST MODE (guarantees sub-second moves)
+    UseMCTS: true
+    MCTSSims: 16
+    QuiescenceDepth: 1
+    ExplorerMaxPlies: 8
+    ExplorerTopN: 10
+    ExplorerMinGames: 100
+    ExplorerWeight: 15
+
+    # Model + basics
+    ModelPath: "/home/chris/models/model.pkl"
+    Hash: 128
+    Threads: 1
+    Move Overhead: 200
+    GameId: "manual-tag"
+    LogPath: "/home/chris/alf_logs/alf_log_YYYY-MM-DD.csv"
+
+  polyglot:
+    enabled: false
+
+  draw_or_resign:
+    resign_enabled: false
+    offer_draw_enabled: true
+    offer_draw_score: 0
+    offer_draw_for_egtb_zero: true
+    offer_draw_moves: 10
+    offer_draw_pieces: 10
+
+  online_moves:
+    max_out_of_book_moves: 10
+    max_retries: 2
+    chessdb_book:
+      enabled: false
+    lichess_cloud_analysis:
+      enabled: false
+    lichess_opening_explorer:
+      enabled: false
+    online_egtb:
+      enabled: false
+
+silence_stderr: false
+abort_time: 30
+fake_think_time: false
+rate_limiting_delay: 0
+move_overhead: 2000
+
+challenge:
+  concurrency: 0
+  variants:
+    - standard
+  time_controls:
+    - blitz
+    - rapid
+    - classical
+  modes:
+    - casual
+    - rated
+
+greeting:
+  hello: "Hi! I'm {me}. Feel free to reach out, or don't, maybe touch grass ;)"
+  goodbye: "Thanks for the game my bot brethren"
+  hello_spectators: "Hi! I'm {me}. Feel free to reach out, or don't, maybe touch grass ;)"
+  goodbye_spectators: "Goodbye humans, thanks for watching"
