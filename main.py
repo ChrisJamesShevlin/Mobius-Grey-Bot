@@ -1,68 +1,104 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Mobius-Grey (ML) — Stockfish-free UCI engine
+Mobius-Grey (ALF) v3 — Explorer + Cloud Eval + Stockfish blended UCI engine
+with Phase-1 ML data capture (CSV logger) and optional tiny ML reranker
 
-- No Stockfish (local or cloud). Explorer allowed for opening stats only.
-- Safety rails, simple heuristic eval, 1-ply lookahead with value,
-  shallow quiescence on captures/checks, optional tiny MCTS.
-- ML: loads model.pkl (win-prob for side-to-move) if present.
-- CSV logging with GameId passthrough; schema matches your workflow.
+- Answers UCI (uci/isready/ucinewgame/position/go/stop/quit)
+- Uses Stockfish MultiPV as a base
+- Adds Explorer (book) EV and Cloud Eval bonuses to candidate moves
+- Clean fallback to pure Stockfish
+- Accepts lichess-bot's common options (Hash, Threads, Move Overhead, Ponder)
+- Extra tunables as UCI options (ExplorerWeight, CloudWeight, MinGames, SFDepth, SFMultiPV, CloudMultiPV, ExplorerTopN)
+- Reranker: UseReranker (tiny ML tie-window reranker), TieWindowCP (window around SF best)
+- v3 NEW: Phase-1 ML logging to CSV (auto-created daily or at LogPath), GameId passthrough
+- v3 NEW: Prints info about reranker mode and log path
+- v2 goodies retained: time-pressure skipping of online calls, LRU cache for Explorer/Cloud, SyzygyPath passthrough
 
-UCI options expected:
-  Hash, Threads, Move Overhead,
-  ExplorerTopN, ExplorerMinGames, ExplorerMaxPlies,
-  ExplorerWeight (INT percent 0..100), UseMCTS, MCTSSims,
-  QuiescenceDepth, ModelPath, GameId, LogPath
+Requires:
+    pip install python-chess requests
+    sudo apt install stockfish   (or set env STOCKFISH_PATH)
+
+Optional:
+    - Drop a scikit/LightGBM-style pickle at ./alf_rerank.pkl or set env ALF_RERANK_MODEL
+      to enable learned reranking. Otherwise a tiny linear fallback is used.
 """
 
-import os, sys, shlex, json, csv, math, time, datetime, pickle, threading, random
-from typing import Optional, List, Tuple, Dict
+import os
+import sys
+import shlex
+import shutil
+import threading
+import math
+import pickle
+import csv
+import json
+import time
+import datetime
+from functools import lru_cache
+from typing import Optional, Dict, List, Tuple
 
 import requests
 import chess
+import chess.engine
 
-# --------------------- HTTP / Explorer ---------------------
+# --------------------- HTTP setup ---------------------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mobius-Grey-ML/1.0 (+lichess-bot uci)"})
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "4.0"))
-EXPLORER_URL = "https://explorer.lichess.ovh/lichess"
+SESSION.headers.update({"User-Agent": "ALF-ExplorerCloud/1.0 (+lichess-bot uci)"})
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "5.0"))
 
-def explorer_request(fen: str, topn: int = 20) -> Optional[dict]:
-    params = {"fen": fen, "variant": "standard", "moves": max(1, topn), "topGames": 0, "recentGames": 0}
+EXPLORER_URL = "https://explorer.lichess.ovh/lichess"
+CLOUD_URL    = "https://lichess.org/api/cloud-eval"
+
+# --------------------- defaults / env -----------------
+def env_i(name: str, default: int) -> int:
     try:
-        r = SESSION.get(EXPLORER_URL, params=params, timeout=HTTP_TIMEOUT)
-        if r.ok: return r.json()
+        return int(os.getenv(name, str(default)))
     except Exception:
-        pass
+        return default
+
+def env_f(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+# Stockfish / search
+DF_HASH      = env_i("SF_HASH", 128)
+DF_THREADS   = env_i("SF_THREADS", 1)
+DF_SF_DEPTH  = env_i("SF_DEPTH", 16)
+DF_SF_MPVS   = env_i("SF_MULTIPV", 8)
+
+# Explorer / cloud
+DF_EXPL_TOPN = env_i("EXPLORER_TOP_MOVES", 30)
+DF_EXPL_MING = env_i("EXPLORER_MIN_GAMES", 10)
+DF_EXPL_W    = env_f("EXPLORER_WEIGHT_CP", 50.0)   # abs cap of cp bonus
+DF_CLOUD_MPVS= env_i("CLOUD_MULTIPV", 6)
+DF_CLOUD_W   = env_f("CLOUD_WEIGHT_CP", 20.0)      # cp/5 capped
+
+# --------------------- helpers ------------------------
+def find_stockfish() -> Optional[str]:
+    envp = os.getenv("STOCKFISH_PATH")
+    if envp and os.path.isfile(envp) and os.access(envp, os.X_OK):
+        return envp
+    p = shutil.which("stockfish")
+    if p: return p
+    p = "/usr/games/stockfish"
+    if os.path.isfile(p) and os.access(p, os.X_OK): return p
     return None
 
-# --------------------- Env helpers ---------------------
-def env_i(name: str, default: int) -> int:
-    try: return int(os.getenv(name, str(default)))
-    except Exception: return default
+def cp_from_score(score: chess.engine.PovScore, white_to_move: bool) -> int:
+    pov = chess.WHITE if white_to_move else chess.BLACK
+    s = score.pov(pov)
+    if s.is_mate():
+        m = s.mate()
+        return 100000 if (m and m > 0) else -100000
+    val = s.score(mate_score=100000)
+    return int(val or 0)
 
-# Compatibility placeholders
-DF_HASH           = env_i("ENGINE_HASH", 128)
-DF_THREADS        = env_i("ENGINE_THREADS", 1)
-
-# Tunables (defaults if not set via UCI)
-DF_EXPL_TOPN      = env_i("EXPLORER_TOP_MOVES", 24)
-DF_EXPL_MING      = env_i("EXPLORER_MIN_GAMES", 6)
-DF_EXPL_MAX_PLIES = env_i("EXPLORER_MAX_PLIES", 14)
-DF_EXPL_WEIGHT_P  = env_i("EXPLORER_WEIGHT_PCT", 30)   # integer percent
-
-DF_USE_MCTS       = (os.getenv("USE_MCTS", "1") != "0")
-DF_MCTS_SIMS      = env_i("MCTS_SIMS", 120)
-DF_Q_DEPTH        = env_i("QUIESCENCE_DEPTH", 2)
-
-DF_MOVE_OVERHEAD  = env_i("MOVE_OVERHEAD_MS", 200)
-
-MODEL_PATH_DEFAULT= os.getenv("MODEL_PATH", "model.pkl")
-LOG_PATH_DEFAULT  = os.getenv("LOG_PATH", "")  # empty => daily auto file
-
-# --------------------- ML model loader ---------------------
-def load_model(path: str) -> Optional[object]:
+def _safe_load_model():
+    """Optionally load a pickled model from env ALF_RERANK_MODEL or ./alf_rerank.pkl."""
+    path = os.getenv("ALF_RERANK_MODEL", "alf_rerank.pkl")
     try:
         if os.path.isfile(path):
             with open(path, "rb") as f:
@@ -71,298 +107,215 @@ def load_model(path: str) -> Optional[object]:
         pass
     return None
 
-def model_predict_value(model, feats: List[float]) -> float:
-    """Return win probability in [0,1] for side-to-move."""
+def _sigmoid(x: float) -> float:
     try:
-        if hasattr(model, "predict_proba"):
-            p = float(model.predict_proba([feats])[0][-1]); return min(1.0, max(0.0, p))
-        if hasattr(model, "decision_function"):
-            z = float(model.decision_function([feats])[0]); return 1.0 / (1.0 + math.exp(-z))
-        if hasattr(model, "predict"):
-            y = float(model.predict([feats])[0])
-            return 1.0 / (1.0 + math.exp(-y)) if abs(y) > 1.0 else (y + 1.0) * 0.5
+        return 1.0 / (1.0 + math.exp(-x))
+    except OverflowError:
+        return 0.0 if x < 0 else 1.0
+
+# --------------------- online data (+ LRU cache) --------------------
+def explorer_request(fen: str, topn: int) -> Optional[dict]:
+    params = {"fen": fen, "variant": "standard", "moves": max(1, topn), "topGames": 0, "recentGames": 0}
+    try:
+        r = SESSION.get(EXPLORER_URL, params=params, timeout=HTTP_TIMEOUT)
+        if r.ok:
+            return r.json()
     except Exception:
         pass
-    return 0.5
+    return None
 
-# --------------------- Heuristic eval ---------------------
-PIECE_VAL = {
-    chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
-    chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 0
-}
+def cloud_request(fen: str, multi_pv: int) -> Optional[dict]:
+    params = {"fen": fen, "multiPv": max(1, multi_pv)}
+    try:
+        r = SESSION.get(CLOUD_URL, params=params, timeout=HTTP_TIMEOUT)
+        if r.ok:
+            return r.json()
+    except Exception:
+        pass
+    return None
 
-# Lightweight piece-square “centrality” table generated once
-def _centrality_table() -> List[int]:
-    vals = []
-    for sq in range(64):
-        f = chess.square_file(sq); r = chess.square_rank(sq)
-        # Manhattan distance to center squares (d=0 at e4/d4/e5/d5)
-        df = min(abs(f-3), abs(f-4))
-        dr = min(abs(r-3), abs(r-4))
-        d = df + dr
-        vals.append(20 - 5*d)  # 20,15,10,5,0,...
-    return vals
-CENT = _centrality_table()
+@lru_cache(maxsize=8192)
+def explorer_request_cached(fen: str, topn: int) -> dict:
+    return explorer_request(fen, topn) or {}
 
-def phase_factor(board: chess.Board) -> float:
-    # 1.0 opening-ish when many pieces; 0.0 endgame-ish
-    return min(1.0, max(0.0, (len(board.piece_map()) - 6) / 24.0))
+@lru_cache(maxsize=8192)
+def cloud_request_cached(fen: str, multi_pv: int) -> dict:
+    return cloud_request(fen, multi_pv) or {}
 
-def material_eval(board: chess.Board) -> int:
-    s = 0
-    for _, pc in board.piece_map().items():
-        s += PIECE_VAL[pc.piece_type] * (1 if pc.color == chess.WHITE else -1)
-    return s
+def explorer_bonus_for(uci: str, ex: dict, min_games: int, cap_cp: float) -> float:
+    """Return cp-like EV from Explorer for a specific move (0 if below min_games)."""
+    if not ex or "moves" not in ex:
+        return 0.0
+    for m in ex["moves"]:
+        if m.get("uci") == uci:
+            g = int(m.get("gameCount", 0))
+            w = float(m.get("white", 0)); d = float(m.get("draws", 0)); b = float(m.get("black", 0))
+            tot = max(1.0, w + d + b)
+            winP  = 100.0 * w / tot
+            drawP = 100.0 * d / tot
+            # cp-ish: prefer wins, slight penalty for drawiness
+            ev = (winP - 50.0) - 0.35 * (drawP - 30.0)
+            ev = max(-cap_cp, min(cap_cp, ev))
+            return ev if g >= min_games else 0.0
+    return 0.0
 
-def pst_eval(board: chess.Board) -> int:
-    s = 0
-    for sq, pc in board.piece_map().items():
-        idx = sq if pc.color == chess.WHITE else chess.square_mirror(sq)
-        # modest piece-dependent scaling
-        scale = {chess.PAWN:1.0, chess.KNIGHT:1.3, chess.BISHOP:1.2, chess.ROOK:0.8, chess.QUEEN:0.6, chess.KING:0.7}[pc.piece_type]
-        v = int(scale * CENT[idx])
-        s += v if pc.color == chess.WHITE else -v
-    return s
+def cloud_bonus_for(uci: str, cloud: dict, cap_cp: float) -> float:
+    """Small bonus based on Cloud Eval PV cp -> cp/5, capped."""
+    if not cloud or "pvs" not in cloud:
+        return 0.0
+    best = 0.0
+    for pv in cloud.get("pvs", []):
+        moves = pv.get("moves", "")
+        if not moves: continue
+        first = moves.split()[0]
+        if first == uci:
+            cp = float(pv.get("cp", 0.0))
+            bonus = max(-cap_cp, min(cap_cp, cp / 5.0))
+            best = max(best, bonus)
+    return best
 
-def mobility_eval(board: chess.Board) -> int:
-    return len(list(board.legal_moves))
-
-def king_safety_eval(board: chess.Board) -> int:
-    def side(color):
-        ksq = board.king(color)
-        if ksq is None: return 0
-        bonus = 0
-        r, f = chess.square_rank(ksq), chess.square_file(ksq)
-        if (color==chess.WHITE and r==0) or (color==chess.BLACK and r==7):
-            if f <= 2 or f >= 5: bonus += 15
-        for df in (-1,0,1):
-            for dr in (1,2):
-                ff, rr = f+df, r+(dr if color==chess.WHITE else -dr)
-                if 0<=ff<8 and 0<=rr<8:
-                    p = board.piece_at(chess.square(ff, rr))
-                    if p and p.piece_type==chess.PAWN and p.color==color: bonus += 6
-        return bonus
-    return side(chess.WHITE) - side(chess.BLACK)
-
-def features_from_board(board: chess.Board) -> List[float]:
-    stm = 1.0 if board.turn == chess.WHITE else -1.0
-    mat = material_eval(board)
-    pst_s = pst_eval(board)
-    mob = mobility_eval(board)
-    ks = king_safety_eval(board)
-    ph = phase_factor(board)
-    counts = [len(board.pieces(pt, chess.WHITE)) - len(board.pieces(pt, chess.BLACK))
-              for pt in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)]
-    return [
-        1.0,
-        stm * (mat / 1000.0),
-        stm * (pst_s / 800.0) * ph,
-        (mob / 40.0),
-        stm * (ks / 100.0),
-        stm * (counts[0] / 8.0),
-        stm * (counts[1] / 4.0),
-        stm * (counts[2] / 4.0),
-        stm * (counts[3] / 4.0),
-        stm * (counts[4] / 2.0),
-        ph,
-    ]
-
-def simple_eval_cp(board: chess.Board) -> int:
-    mat = material_eval(board)
-    pst_s = pst_eval(board)
-    mob = mobility_eval(board)
-    ks  = king_safety_eval(board)
-    ph  = phase_factor(board)
-    return int(0.9*mat + 0.6*pst_s*ph + 0.2*mob + 0.4*ks)
-
-def ml_value(board: chess.Board, model) -> float:
-    feats = features_from_board(board)
-    if model is not None:
-        return model_predict_value(model, feats)
-    cp = simple_eval_cp(board)
-    return 1.0 / (1.0 + math.exp(-(cp / 140.0)))
-
-# --------------------- Safety rails ---------------------
-def move_is_hang(board: chess.Board, mv: chess.Move) -> bool:
-    us = board.turn
-    if board.is_capture(mv):  # recaptures checked later
-        return False
-    tmp = board.copy(stack=False)
-    try: tmp.push(mv)
-    except Exception: return True
-    to_sq = mv.to_square
-    opp = not us
-    if tmp.is_attacked_by(opp, to_sq) and not tmp.is_attacked_by(us, to_sq):
-        return True
-    return False
-
-def legal_moves_ordered(board: chess.Board) -> List[chess.Move]:
-    moves = list(board.legal_moves)
-    def key(m):
-        k = 0
-        if board.is_capture(m): k += 50
-        if board.gives_check(m): k += 20
-        if chess.square_file(m.to_square) in (3,4) and chess.square_rank(m.to_square) in (3,4): k += 5
-        if m.promotion: k += 80
-        return -k
-    return sorted(moves, key=key)
-
-# --------------------- Quiescence ---------------------
-def quiesce_value(board: chess.Board, model, depth: int) -> float:
-    base = ml_value(board, model)
-    if depth <= 0: return base
-    forcing = [m for m in board.legal_moves if board.is_capture(m) or board.gives_check(m)]
-    if not forcing: return base
-    best = 0.0; first = True
-    for mv in forcing:
-        tmp = board.copy(stack=False)
-        try: tmp.push(mv)
-        except Exception: continue
-        val = 1.0 - quiesce_value(tmp, model, depth - 1)
-        if first or val > best:
-            best, first = val, False
-    return max(base, best)
-
-# --------------------- Tiny MCTS ---------------------
-class MCTS:
-    def __init__(self, model, explorer_weight: float, q_depth: int):
-        self.Q: Dict[Tuple[str,str], float] = {}
-        self.N: Dict[Tuple[str,str], int] = {}
-        self.Ns: Dict[str, int] = {}
-        self.model = model
-        self.c_puct = 1.2
-        self.explorer_weight = explorer_weight
-        self.q_depth = q_depth
-
-    def policy_prior(self, board: chess.Board, moves: List[chess.Move], explorer: Optional[dict]) -> Dict[str, float]:
-        pri = {}
-        # Explorer prior
-        exp: Dict[str, Tuple[float,float]] = {}
-        if explorer and "moves" in explorer:
-            tot = 0.0
-            for m in explorer["moves"]:
-                g = float(m.get("gameCount", 0) or 0.0)
-                w = float(m.get("white", 0) or 0.0)
-                d = float(m.get("draws", 0) or 0.0)
-                allp = max(1.0, w + d + (g - (w + d)))
-                wr = w / allp
-                exp[m.get("uci","")] = (g, wr); tot += g
-            if tot > 0:
-                for u in list(exp.keys()):
-                    g, wr = exp[u]; exp[u] = (g/tot, wr)
-
-        # ML prior via leaf value of child
-        vals = {}
-        for mv in moves:
-            tmp = board.copy(stack=False)
-            try: tmp.push(mv)
-            except Exception: continue
-            v = quiesce_value(tmp, self.model, self.q_depth)
-            vals[mv.uci()] = v
-
-        for mv in moves:
-            u = mv.uci()
-            mlp = vals.get(u, 0.5)
-            eg, ewr = exp.get(u, (0.0, 0.5))
-            ep = 0.5*eg + 0.5*ewr
-            p = (1.0 - self.explorer_weight) * mlp + self.explorer_weight * ep
-            pri[u] = max(1e-6, min(1.0, p))
-        s = sum(pri.values())
-        if s > 0:
-            for k in pri:
-                pri[k] /= s
-        return pri
-
-    def uct_select(self, fen: str, moves: List[chess.Move], pri: Dict[str, float]) -> chess.Move:
-        best, best_score = None, -1e18
-        for mv in moves:
-            u = mv.uci()
-            q = self.Q.get((fen, u), 0.5)
-            n = self.N.get((fen, u), 0)
-            ns = self.Ns.get(fen, 1)
-            p = pri.get(u, 1.0/len(moves))
-            ucb = q + 1.2 * p * math.sqrt(ns) / (1 + n)
-            if ucb > best_score:
-                best, best_score = mv, ucb
-        return best or random.choice(moves)
-
-    def simulate(self, board: chess.Board, explorer: Optional[dict], depth_cap: int = 8) -> float:
-        fen = board.fen()
-        moves = legal_moves_ordered(board)
-        if not moves or board.is_game_over():
-            res = board.result(claim_draw=True)
-            if res == "1-0": return 1.0 if board.turn == chess.BLACK else 0.0
-            if res == "0-1": return 1.0 if board.turn == chess.WHITE else 0.0
-            return 0.5
-        pri = self.policy_prior(board, moves, explorer)
-        mv = self.uct_select(fen, moves, pri)
-        child = board.copy(stack=False)
-        child.push(mv)
-        if depth_cap <= 1:
-            leaf = quiesce_value(child, self.model, self.q_depth)
-            val = 1.0 - leaf
-        else:
-            val = 1.0 - self.simulate(child, None, depth_cap - 1)
-        key = (fen, mv.uci())
-        self.N[key] = self.N.get(key, 0) + 1
-        self.Ns[fen] = self.Ns.get(fen, 0) + 1
-        q_old = self.Q.get(key, 0.5); n = self.N[key]
-        self.Q[key] = q_old + (val - q_old) / n
-        return val
-
-    def best_move(self, board: chess.Board, explorer: Optional[dict], sims: int) -> chess.Move:
-        root_moves = legal_moves_ordered(board)
-        if not root_moves: raise StopIteration
-        fen = board.fen()
-        for _ in range(max(1, sims)):
-            self.simulate(board, explorer, depth_cap=8)
-        best, best_q = root_moves[0], -1.0
-        for mv in root_moves:
-            q = self.Q.get((fen, mv.uci()), 0.5)
-            if q > best_q:
-                best, best_q = mv, q
-        return best
-
-# --------------------- Engine ---------------------
-class MLEngine:
+# --------------------- Engine -------------------------
+class ALFEngine:
     def __init__(self):
         self.board = chess.Board()
+        # UCI options (must accept for lichess-bot)
         self.hash = DF_HASH
         self.threads = DF_THREADS
-        self.move_overhead = DF_MOVE_OVERHEAD
+        self.move_overhead = 200   # milliseconds
+        self.ponder = False
 
-        # Options
+        # Tunables (also via UCI options)
+        self.sf_depth = DF_SF_DEPTH
+        self.sf_multipv = DF_SF_MPVS
         self.expl_topn = DF_EXPL_TOPN
         self.expl_min_games = DF_EXPL_MING
-        self.expl_max_plies = DF_EXPL_MAX_PLIES
-        self.expl_weight = DF_EXPL_WEIGHT_P / 100.0  # 0..1
+        self.expl_weight = DF_EXPL_W
+        self.cloud_multipv = DF_CLOUD_MPVS
+        self.cloud_weight = DF_CLOUD_W
 
-        self.use_mcts = DF_USE_MCTS
-        self.mcts_sims = DF_MCTS_SIMS
-        self.q_depth = DF_Q_DEPTH
+        # Reranker (mini-ML) defaults
+        self.use_reranker = True
+        self.tie_window_cp = 25
+        self.model = _safe_load_model()  # optional pickle (e.g., LogisticRegression/LightGBM)
+        try:
+            print(f"info string reranker={'model' if self.model else 'fallback'}", flush=True)
+        except Exception:
+            pass
 
-        self.model_path = MODEL_PATH_DEFAULT
-        self.model = load_model(self.model_path)
-
-        # Logging
+        # Logging / dataset capture (Phase-1)
         self.game_id = ""
-        self.log_path = LOG_PATH_DEFAULT
+        self.log_path = os.getenv("ALF_LOG_PATH", "")  # empty => daily auto file
         self._ply = 0
         self._log_path_announced = False
 
-        # Metadata no-ops
+        # No-op placeholders (make wrappers happy, keep max strength)
+        self.syzygy_path = ""
         self.uci_limit_strength = False
         self.uci_elo = 2850
         self.uci_showwdl = False
         self.uci_analysemode = False
         self.uci_chess960 = False
 
-        print(f"info string model={'loaded' if self.model else 'none'} path={self.model_path}", flush=True)
-        print(f"info string explorer_weight={self.expl_weight:.2f} mcts={self.use_mcts} sims={self.mcts_sims} qd={self.q_depth}", flush=True)
-
+        # Stockfish
+        path = find_stockfish()
+        if not path:
+            print("info string Stockfish not found", flush=True)
+            sys.exit(1)
+        self.sf = chess.engine.SimpleEngine.popen_uci(path)
+        self.sf.configure({"Threads": self.threads, "Hash": self.hash})
         self.lock = threading.Lock()
 
-    # --------- Logging ----------
+    # --------- Reranker feature extraction & scoring ----------
+    def _phase(self) -> int:
+        # crude phase: count pieces (fewer => endgame)
+        return len(self.board.piece_map())
+
+    def _features_for(self, mv: chess.Move, base_cp: int, ex: dict, cl: dict) -> List[float]:
+        """Compute a tiny feature vector for (mv, position). Keep super cheap."""
+        uci = mv.uci()
+        # Explorer
+        ex_g = ex_w = ex_d = 0.0
+        if ex and "moves" in ex:
+            for m in ex["moves"]:
+                if m.get("uci") == uci:
+                    ex_g = float(m.get("gameCount", 0) or 0.0)
+                    ex_w = float(m.get("white", 0) or 0.0)
+                    ex_d = float(m.get("draws", 0) or 0.0)
+                    break
+        ex_tot = max(1.0, ex_w + ex_d + float(ex_g - (ex_w + ex_d)))
+        ex_winp = ex_w / ex_tot
+        ex_drawp = ex_d / ex_tot
+        ex_logg = math.log1p(ex_g)
+
+        # Cloud (best matching PV)
+        cl_cp = 0.0
+        cl_depth = 0.0
+        cl_rank = 0.0
+        if cl and "pvs" in cl:
+            for i, pv in enumerate(cl["pvs"], start=1):
+                s = pv.get("moves", "")
+                if s and s.split()[0] == uci:
+                    cl_cp = float(pv.get("cp", 0.0) or 0.0)
+                    cl_depth = float(pv.get("depth", 0.0) or 0.0)
+                    cl_rank = 1.0 / i
+                    break
+
+        # Local cheap flags
+        is_cap = 1.0 if self.board.is_capture(mv) else 0.0
+        gives_chk = 1.0 if self.board.gives_check(mv) else 0.0
+        to_center = 1.0 if chess.square_file(mv.to_square) in (3,4) and chess.square_rank(mv.to_square) in (3,4) else 0.0
+        phase = float(self._phase())
+
+        # Normalize base_cp roughly to [-1,1] around 100cp scale
+        base_norm = max(-2.0, min(2.0, base_cp / 100.0))
+
+        return [
+            1.0,            # bias
+            base_norm,      # SF centipawn (normalized)
+            ex_winp,        # explorer win rate (0..1)
+            ex_drawp,       # explorer draw rate
+            ex_logg,        # log(1+games)
+            cl_cp / 100.0,  # cloud cp (normalized)
+            cl_depth / 40.0,# cloud depth (0..~1)
+            cl_rank,        # 1/rank
+            is_cap, gives_chk, to_center,
+            phase / 32.0,   # coarse phase scale
+        ]
+
+    def _score_with_model(self, feats: List[float]) -> float:
+        """Return a scalar score. If model exists, use it; else tiny linear fallback."""
+        if self.model is not None:
+            try:
+                if hasattr(self.model, "predict_proba"):
+                    p = float(self.model.predict_proba([feats])[0][-1])
+                    return p
+                if hasattr(self.model, "decision_function"):
+                    z = float(self.model.decision_function([feats])[0])
+                    return _sigmoid(z)
+                if hasattr(self.model, "predict"):
+                    y = float(self.model.predict([feats])[0])
+                    return y
+            except Exception:
+                pass
+        # Fallback linear “tiny brain” (hand-tuned but ML-shaped)
+        w = [  # same length as feats
+            0.0,     # bias
+            0.9,     # base_norm (trust SF)
+            0.4,     # ex_winp
+            -0.1,    # ex_drawp (slightly prefer less drawish)
+            0.15,    # ex_logg (trust big samples)
+            0.25,    # cloud cp
+            0.2,     # cloud depth
+            0.15,    # 1/rank
+            0.05,    # is_cap
+            0.05,    # gives_check
+            0.04,    # to_center
+            -0.05,   # phase (prefer simpler in endgame if close)
+        ]
+        z = sum(a*b for a,b in zip(w, feats))
+        return _sigmoid(z)
+
+    # ----------------- Logging helpers -----------------
     def _effective_log_path(self) -> str:
         return self.log_path or f"alf_log_{datetime.date.today().isoformat()}.csv"
 
@@ -370,41 +323,57 @@ class MLEngine:
         try:
             path = self._effective_log_path()
             need_header = not os.path.exists(path)
+            # Announce once where we're logging
             if not self._log_path_announced:
-                print(f"info string logging to {path}", flush=True)
+                try:
+                    print(f"info string logging to {path}", flush=True)
+                except Exception:
+                    pass
                 self._log_path_announced = True
             with open(path, "a", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=[
                     "ts","game_id","ply","fen","turn",
-                    "chosen_uci","mode","explorer_used","candidates_json"
+                    "chosen_uci","mode","sf_best_cp","chosen_sf_cp","tie_window_cp",
+                    "explorer_used","cloud_used","candidates_json"
                 ])
-                if need_header: w.writeheader()
+                if need_header:
+                    w.writeheader()
                 w.writerow(row)
         except Exception as e:
-            print(f"info string log_csv_error={e}", flush=True)
+            try:
+                print(f"info string log_csv_error={e}", flush=True)
+            except Exception:
+                pass
 
-    # --------- UCI protocol ----------
+    # ----------------- UCI protocol -----------------
     def uci(self):
-        print("id name Mobius-Grey ML", flush=True)
+        print("id name Mobius-Grey ALF v3", flush=True)
         print("id author chris", flush=True)
 
-        print(f"option name Hash type spin default {self.hash} min 16 max 4096", flush=True)
-        print(f"option name Threads type spin default {self.threads} min 1 max 32", flush=True)
-        print(f"option name Move Overhead type spin default {self.move_overhead} min 0 max 10000", flush=True)
+        # Required/common options
+        print(f"option name Hash type spin default {DF_HASH} min 16 max 4096", flush=True)
+        print(f"option name Threads type spin default {DF_THREADS} min 1 max 32", flush=True)
+        print("option name Move Overhead type spin default 200 min 0 max 10000", flush=True)
         print("option name Ponder type check default false", flush=True)
 
-        print(f"option name ExplorerTopN type spin default {self.expl_topn} min 5 max 100", flush=True)
-        print(f"option name ExplorerMinGames type spin default {self.expl_min_games} min 0 max 1000", flush=True)
-        print(f"option name ExplorerMaxPlies type spin default {self.expl_max_plies} min 0 max 40", flush=True)
-        print(f"option name ExplorerWeight type spin default {int(self.expl_weight*100)} min 0 max 100", flush=True)
-        print(f"option name UseMCTS type check default {'true' if self.use_mcts else 'false'}", flush=True)
-        print(f"option name MCTSSims type spin default {self.mcts_sims} min 10 max 2000", flush=True)
-        print(f"option name QuiescenceDepth type spin default {self.q_depth} min 0 max 4", flush=True)
-        print(f"option name ModelPath type string default {self.model_path}", flush=True)
+        # Tunables
+        print(f"option name SFDepth type spin default {DF_SF_DEPTH} min 6 max 40", flush=True)
+        print(f"option name SFMultiPV type spin default {DF_SF_MPVS} min 1 max 16", flush=True)
+        print(f"option name ExplorerTopN type spin default {DF_EXPL_TOPN} min 5 max 100", flush=True)
+        print(f"option name ExplorerMinGames type spin default {DF_EXPL_MING} min 0 max 1000", flush=True)
+        print(f"option name ExplorerWeight type spin default {DF_EXPL_W:.0f} min 0 max 200", flush=True)
+        print(f"option name CloudMultiPV type spin default {DF_CLOUD_MPVS} min 1 max 16", flush=True)
+        print(f"option name CloudWeight type spin default {DF_CLOUD_W:.0f} min 0 max 200", flush=True)
 
+        # Reranker options
+        print("option name UseReranker type check default true", flush=True)
+        print("option name TieWindowCP type spin default 25 min 0 max 200", flush=True)
+
+        # Logging / metadata
         print("option name GameId type string default ", flush=True)
         print(f"option name LogPath type string default {self.log_path or 'alf_log_YYYY-MM-DD.csv'}", flush=True)
 
+        # Compatibility no-ops
         print("option name SyzygyPath type string default ", flush=True)
         print("option name UCI_LimitStrength type check default false", flush=True)
         print("option name UCI_Elo type spin default 2850 min 1100 max 3600", flush=True)
@@ -418,50 +387,56 @@ class MLEngine:
         print("readyok", flush=True)
 
     def ucinewgame(self):
-        self.board.reset(); self._ply = 0
+        self.board.reset()
+        self._ply = 0
 
     def setoption(self, name: str, value: str):
         key = name.strip().lower().replace(" ", "")
         try:
             if key == "hash":
-                self.hash = int(value)
+                self.hash = int(value); self.sf.configure({"Hash": self.hash})
             elif key == "threads":
-                self.threads = int(value)
+                self.threads = int(value); self.sf.configure({"Threads": self.threads})
             elif key == "moveoverhead":
                 self.move_overhead = int(value)
             elif key == "ponder":
-                pass
+                self.ponder = str(value).lower() == "true"
+            elif key == "sfdepth":
+                self.sf_depth = int(value)
+            elif key == "sfmultipv":
+                self.sf_multipv = max(1, int(value))
             elif key == "explorertopn":
                 self.expl_topn = max(1, int(value))
             elif key == "explorermingames":
                 self.expl_min_games = max(0, int(value))
-            elif key == "explorermaxplies":
-                self.expl_max_plies = max(0, int(value))
             elif key == "explorerweight":
-                self.expl_weight = max(0.0, min(1.0, float(int(value)) / 100.0))
-            elif key == "usemcts":
-                self.use_mcts = (str(value).lower() == "true")
-            elif key == "mctssims":
-                self.mcts_sims = max(10, int(value))
-            elif key == "quiescencedepth":
-                self.q_depth = max(0, int(value))
-            elif key == "modelpath":
-                self.model_path = value or self.model_path
-                self.model = load_model(self.model_path)
-                print(f"info string model={'loaded' if self.model else 'none'} path={self.model_path}", flush=True)
+                self.expl_weight = max(0.0, float(value))
+            elif key == "cloudmultipv":
+                self.cloud_multipv = max(1, int(value))
+            elif key == "cloudweight":
+                self.cloud_weight = max(0.0, float(value))
+            elif key == "usereranker":
+                self.use_reranker = (str(value).lower() == "true")
+            elif key == "tiewindowcp":
+                self.tie_window_cp = max(0, int(value))
             elif key == "gameid":
                 self.game_id = value or ""
             elif key == "logpath":
                 self.log_path = value or ""
+                # Reset announce so we re-print if path changes
                 self._log_path_announced = False
             elif key == "syzygypath":
-                pass
+                self.syzygy_path = value or ""
+                try:
+                    self.sf.configure({"SyzygyPath": self.syzygy_path})
+                except Exception:
+                    pass
             elif key == "uci_limitstrength":
                 self.uci_limit_strength = False
             elif key == "uci_elo":
                 self.uci_elo = 2850
             elif key == "uci_showwdl":
-                self.uci_showwdl = (str(value).lower() == "true")
+                self.uci_showwdl = str(value).lower() == "true"
             elif key == "uci_analysemode":
                 self.uci_analysemode = False
             elif key == "uci_chess960":
@@ -469,126 +444,240 @@ class MLEngine:
         except Exception:
             pass
 
+    # ---- Position / search logic ----
     def position(self, tokens: List[str]):
         if not tokens: return
         if tokens[0] == "startpos":
             self.board.reset(); self._ply = 0
             if len(tokens) >= 3 and tokens[1] == "moves":
                 for u in tokens[2:]:
-                    try: self.board.push_uci(u); self._ply += 1
-                    except Exception: break
+                    try:
+                        self.board.push_uci(u); self._ply += 1
+                    except Exception:
+                        break
         elif tokens[0] == "fen":
             fen = " ".join(tokens[1:7])
-            try: self.board.set_fen(fen); self._ply = 0
-            except Exception: return
+            try:
+                self.board.set_fen(fen)
+                # Conservative: reset ply on manual FEN; will rebuild from subsequent moves
+                self._ply = 0
+            except Exception:
+                return
             tail = tokens[7:]
             if tail and tail[0] == "moves":
                 for u in tail[1:]:
-                    try: self.board.push_uci(u); self._ply += 1
-                    except Exception: break
+                    try:
+                        self.board.push_uci(u); self._ply += 1
+                    except Exception:
+                        break
 
-    def _explorer_ok(self) -> bool:
-        return self._ply < self.expl_max_plies and self.expl_weight > 0.0
+    def _should_query_online(self, movetime_ms: Optional[int], wtime: Optional[int], btime: Optional[int]) -> bool:
+        # Skip online calls in tiny movetime or severe time pressure
+        if movetime_ms is not None and movetime_ms < 200:
+            return False
+        if wtime is not None and btime is not None:
+            side_ms = wtime if self.board.turn == chess.WHITE else btime
+            if side_ms < 3000:
+                return False
+        return True
+
+    def sf_heads(self, movetime_ms: Optional[int], wtime: Optional[int], btime: Optional[int],
+                 winc: int, binc: int) -> List[Tuple[chess.Move, int]]:
+        if movetime_ms is not None:
+            # Apply Move Overhead
+            oh = max(0.0, self.move_overhead)
+            tm_ms = max(10.0, movetime_ms - oh)
+            limit = chess.engine.Limit(time=tm_ms / 1000.0)
+        elif wtime is not None and btime is not None:
+            side = self.board.turn
+            rem_ms = float(wtime if side == chess.WHITE else btime)
+            inc_ms = float(winc if side == chess.WHITE else binc)
+            oh = max(0.0, float(self.move_overhead))
+            t_ms = max(40.0, min(5000.0, rem_ms / 30.0 + inc_ms - oh))
+            limit = chess.engine.Limit(time=t_ms / 1000.0)
+        else:
+            limit = chess.engine.Limit(depth=self.sf_depth)
+
+        with self.lock:
+            info_list = self.sf.analyse(self.board, limit, multipv=self.sf_multipv)
+
+        heads: List[Tuple[chess.Move, int]] = []
+        seen = set()
+        wt = self.board.turn
+        for inf in info_list:
+            pv = inf.get("pv")
+            if not pv: continue
+            mv = pv[0]
+            if mv in seen: continue
+            seen.add(mv)
+            cp = cp_from_score(inf["score"], wt)
+            heads.append((mv, cp))
+
+        if not heads:
+            try:
+                m0 = next(iter(self.board.legal_moves))
+                heads = [(m0, 0)]
+            except StopIteration:
+                heads = []
+        return heads
 
     def pick_move(self, movetime_ms: Optional[int], wtime: Optional[int], btime: Optional[int],
                   winc: int, binc: int) -> Optional[chess.Move]:
+        heads = self.sf_heads(movetime_ms, wtime, btime, winc, binc)
+        if not heads:
+            return None
 
-        under_time = False
-        if wtime is not None and btime is not None:
-            side_ms = wtime if self.board.turn == chess.WHITE else btime
-            if side_ms < (2000 + self.move_overhead): under_time = True
+        fen = self.board.fen()
+        ex = cl = None
+        if (self.expl_weight > 0 or self.cloud_weight > 0) and self._should_query_online(movetime_ms, wtime, btime):
+            ex = explorer_request_cached(fen, self.expl_topn)
+            cl = cloud_request_cached(fen, self.cloud_multipv)
 
-        explorer = None
-        if self._explorer_ok() and not under_time:
-            explorer = explorer_request(self.board.fen(), self.expl_topn)
-            if explorer and "moves" in explorer:
-                explorer["moves"] = [m for m in explorer["moves"]
-                                     if int(m.get("gameCount",0) or 0) >= self.expl_min_games]
-                if not explorer["moves"]: explorer = None
+        # Baseline: compute blended scores
+        blended_scores: List[Tuple[chess.Move, int, float]] = []
+        best_mv, best_score = None, -1e18
+        for mv, base_cp in heads:
+            uci = mv.uci()
+            score = float(base_cp)
+            if ex:
+                score += explorer_bonus_for(uci, ex, self.expl_min_games, self.expl_weight)
+            if cl:
+                score += cloud_bonus_for(uci, cl, self.cloud_weight)
+            if self.board.is_capture(mv) or self.board.gives_check(mv):
+                score += 2.0
+            blended_scores.append((mv, base_cp, score))
+            if score > best_score:
+                best_score, best_mv = score, mv
 
-        moves = legal_moves_ordered(self.board)
-        safe_moves = [m for m in moves if not move_is_hang(self.board, m)] or moves
-        if not safe_moves: return None
-
-        if self.use_mcts and not under_time:
-            mcts = MCTS(self.model, explorer_weight=(self.expl_weight if explorer else 0.0), q_depth=self.q_depth)
-            chosen = mcts.best_move(self.board, explorer, sims=self.mcts_sims)
-            mode = "mcts"
+        if not self.use_reranker or len(blended_scores) <= 1:
+            chosen = best_mv or heads[0][0]
+            why = "no_ml"
         else:
-            best, best_val = None, -1.0
-            for mv in safe_moves:
-                tmp = self.board.copy(stack=False)
-                try: tmp.push(mv)
-                except Exception: continue
-                v = quiesce_value(tmp, self.model, self.q_depth if not under_time else 0)
-                val = 1.0 - v
-                if explorer:
-                    for m in explorer.get("moves", []):
-                        if m.get("uci") == mv.uci():
-                            g = float(m.get("gameCount",0) or 0.0)
-                            w = float(m.get("white",0) or 0.0); d=float(m.get("draws",0) or 0.0)
-                            allp = max(1.0, w + d + (g - (w + d)))
-                            wr = w / allp
-                            pop = min(1.0, g / 1000.0)
-                            prior = 0.5*pop + 0.5*wr
-                            val = (1.0 - self.expl_weight) * val + self.expl_weight * prior
-                            break
-                if val > best_val: best, best_val = mv, val
-            chosen = best or safe_moves[0]
-            mode = "1ply"
+            # Rerank only among near-equals by SF base cp
+            sf_best = max(cp for _, cp, _ in blended_scores)
+            window = self.tie_window_cp
+            candidates = [(mv, base_cp, score) for (mv, base_cp, score) in blended_scores
+                          if base_cp >= sf_best - window]
+            if not candidates:
+                chosen = best_mv or heads[0][0]
+                why = "no_candidates"
+            else:
+                best_mv_ml, best_s = None, -1e9
+                for mv, base_cp, _ in candidates:
+                    feats = self._features_for(mv, base_cp, ex or {}, cl or {})
+                    s = self._score_with_model(feats)
+                    if s > best_s:
+                        best_s, best_mv_ml = s, mv
+                # Failsafe: don't take a move far worse than SF best
+                picked_cp = next(cp for m, cp, _ in blended_scores if m == best_mv_ml)
+                if picked_cp < sf_best - 100:
+                    chosen = best_mv
+                    why = "fallback_sf"
+                else:
+                    chosen = best_mv_ml
+                    why = "rerank"
+                try:
+                    print(f"info string pick={chosen.uci()} sf_best={sf_best} picked_cp={picked_cp} mode={why} window={window} ml={best_s:.3f}", flush=True)
+                except Exception:
+                    pass
 
-        # Log
+        # --- Phase-1 ML logging (CSV) ---
         try:
-            cand_rows = [{"uci": mv.uci()} for mv in safe_moves[:20]]
+            # Compute sf_best for logging even if no ML path
+            sf_best_for_log = max(cp for _, cp, _ in blended_scores) if blended_scores else None
+            chosen_sf_cp = None
+            chosen_mv = chosen or best_mv or heads[0][0]
+            for m, cp, _ in blended_scores:
+                if m == chosen_mv:
+                    chosen_sf_cp = cp
+                    break
+            cand_rows = []
+            for mv, base_cp, blend in blended_scores:
+                feats = self._features_for(mv, base_cp, ex or {}, cl or {})
+                cand_rows.append({"uci": mv.uci(), "sf_cp": base_cp, "blend": blend, "feats": feats})
+
             row = {
                 "ts": time.time(),
                 "game_id": self.game_id,
-                "ply": self._ply + 1,
+                "ply": self._ply + 1,  # about to play this move
                 "fen": self.board.fen(),
                 "turn": "w" if self.board.turn else "b",
-                "chosen_uci": chosen.uci() if chosen else None,
-                "mode": mode,
-                "explorer_used": 1 if explorer else 0,
-                "candidates_json": json.dumps(cand_rows, separators=(",",":")),
+                "chosen_uci": chosen_mv.uci() if chosen_mv else None,
+                "mode": why,
+                "sf_best_cp": sf_best_for_log,
+                "chosen_sf_cp": chosen_sf_cp,
+                "tie_window_cp": self.tie_window_cp,
+                "explorer_used": 1 if ex else 0,
+                "cloud_used": 1 if cl else 0,
+                "candidates_json": json.dumps(cand_rows, separators=(",", ":")),
             }
             self._log_csv_row(row)
         except Exception as e:
-            print(f"info string log_pack_error={e}", flush=True)
+            try:
+                print(f"info string log_pack_error={e}", flush=True)
+            except Exception:
+                pass
 
-        return chosen
+        return chosen or best_mv or heads[0][0]
 
     def go_and_print(self, cmd: str):
         parts = cmd.split()
         def gi(tag): return int(parts[parts.index(tag)+1]) if tag in parts else None
-        movetime = gi("movetime"); wtime = gi("wtime"); btime = gi("btime")
-        winc = gi("winc") or 0; binc = gi("binc") or 0
+        movetime = gi("movetime")
+        wtime    = gi("wtime")
+        btime    = gi("btime")
+        winc     = gi("winc") or 0
+        binc     = gi("binc") or 0
+
         mv = self.pick_move(movetime, wtime, btime, winc, binc)
-        print("bestmove " + (mv.uci() if mv else "0000"), flush=True)
+        if mv is None:
+            print("bestmove 0000", flush=True)
+        else:
+            print("bestmove " + mv.uci(), flush=True)
 
     def loop(self):
         while True:
             line = sys.stdin.readline()
-            if not line: break
+            if not line:
+                break
             line = line.strip()
-            if not line: continue
-            if line == "uci": self.uci()
-            elif line == "isready": self.isready()
-            elif line == "ucinewgame": self.ucinewgame()
+            if not line:
+                continue
+            if line == "uci":
+                self.uci()
+            elif line == "isready":
+                self.isready()
+            elif line == "ucinewgame":
+                self.ucinewgame()
             elif line.startswith("setoption"):
-                try: parts = shlex.split(line)
-                except Exception: parts = line.split()
+                try:
+                    parts = shlex.split(line)
+                except Exception:
+                    parts = line.split()
                 name, value, seen_value = [], None, False
                 for tok in parts[1:]:
                     if tok == "name": continue
-                    if tok == "value": seen_value = True; continue
-                    if seen_value: value = tok if value is None else value + " " + tok
-                    else: name.append(tok)
+                    if tok == "value":
+                        seen_value = True
+                        continue
+                    if seen_value:
+                        value = tok if value is None else value + " " + tok
+                    else:
+                        name.append(tok)
                 self.setoption(" ".join(name), value if value is not None else "")
-            elif line.startswith("position"): self.position(line.split()[1:])
-            elif line.startswith("go"): self.go_and_print(line)
-            elif line == "stop": pass
-            elif line == "quit": break
+            elif line.startswith("position"):
+                self.position(line.split()[1:])
+            elif line.startswith("go"):
+                self.go_and_print(line)
+            elif line == "stop":
+                pass
+            elif line == "quit":
+                break
+        try:
+            self.sf.close()
+        except Exception:
+            pass
 
-# --------------------- entry ---------------------
+# --------------------- entry -------------------------
 if __name__ == "__main__":
-    MLEngine().loop()
+    ALFEngine().loop()
