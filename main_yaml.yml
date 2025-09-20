@@ -12,15 +12,15 @@ engine:
   uci_options:
     # FAST MODE (guarantees sub-second moves)
     UseMCTS: true
-    MCTSSims: 16
+    MCTSSims: 24
     QuiescenceDepth: 1
-    ExplorerMaxPlies: 8
-    ExplorerTopN: 10
-    ExplorerMinGames: 100
-    ExplorerWeight: 15
+    ExplorerMaxPlies: 10
+    ExplorerTopN: 8
+    ExplorerMinGames: 50
+    ExplorerWeight: 12
 
     # Model + basics
-    ModelPath: "/home/chris/models/model.pkl"
+    ModelPath: "/home/chris/ml_train/models/model.pkl"
     Hash: 128
     Threads: 1
     Move Overhead: 200
