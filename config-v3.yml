@@ -3,8 +3,8 @@ url: "https://lichess.org/"        # Lichess base URL.
 
 engine:                            # Engine settings.
   dir: "/home/chris/Documents/Python_Projects/Chess"
-  name: "Mobius-Grey-Bot.py"
-  cmd: "python3 Mobius-Grey-Bot.py"            # Directory containing the engine. This can be an absolute path or one relative to lichess-bot/.
+  name: "Mobius-Grey-bot.py"
+  cmd: "python3 Mobius-Grey-bot.py"            # Directory containing the engine. This can be an absolute path or one relative to lichess-bot/.
                 # Binary name of the engine to use.
 # interpreter: "java"
 # interpreter_options:
@@ -100,15 +100,18 @@ engine:                            # Engine settings.
   uci_options:                     # Arbitrary UCI options passed to the engine.
     Move Overhead: 200             # Increase if your bot flags games too often.
     LogPath: /home/chris/alf-data/alf_log.csv
+    GameId: "20/09/2025-1"
     Threads: 4                     # Max CPU threads the engine can use.
-    Hash: 1024                      # Max memory (in megabytes) the engine can allocate.
+    Hash: 512                      # Max memory (in megabytes) the engine can allocate.
     SyzygyPath: "./syzygy/"        # Paths to Syzygy endgame tablebases that the engine reads.
     UCI_ShowWDL: true              # Show the chance of the engine winning.
     UseReranker: true
-    SFMultiPV: 8
+    SFMultiPV: 4
+    SFDepth: 14
     TieWindowCP: 20
     ExplorerWeight: 20
     CloudWeight: 10
+    UseReranker: true
 #   go_commands:                   # Additional options to pass to the UCI go command.
 #     nodes: 1                     # Search so many nodes only.
 #     depth: 5                     # Search depth ply only.
