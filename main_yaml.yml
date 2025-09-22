@@ -100,22 +100,22 @@ engine:                            # Engine settings.
   uci_options:                     # Arbitrary UCI options passed to the engine.
     Move Overhead: 200             # Increase if your bot flags games too often.
     LogPath: /home/chris/alf-data/alf_log.csv
-    GameId: "20/09/2025-1"
+    GameId: "22/09/2025"
     Threads: 4                     # Max CPU threads the engine can use.
     Hash: 512                      # Max memory (in megabytes) the engine can allocate.
     SyzygyPath: "./syzygy/"        # Paths to Syzygy endgame tablebases that the engine reads.
     UCI_ShowWDL: true              # Show the chance of the engine winning.
     UseReranker: true
-    SFMultiPV: 4
-    SFDepth: 14
+    SFMultiPV: 3
+    SFDepth: 12
     TieWindowCP: 20
     ExplorerWeight: 20
     CloudWeight: 10
     UseReranker: true
-#   go_commands:                   # Additional options to pass to the UCI go command.
+  go_commands:                   # Additional options to pass to the UCI go command.
 #     nodes: 1                     # Search so many nodes only.
 #     depth: 5                     # Search depth ply only.
-#     movetime: 1000               # Integer. Search exactly movetime milliseconds.
+     movetime: 450               # Integer. Search exactly movetime milliseconds.
 
 # xboard_options:                  # Arbitrary XBoard options passed to the engine.
 #   cores: "4"
